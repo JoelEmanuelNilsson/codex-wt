@@ -24,6 +24,29 @@ fn run(args: &[&str], codex_home: &Path) -> Value {
     serde_json::from_slice(&output.stdout).expect("json output")
 }
 
+fn run_failure(args: &[&str], codex_home: &Path) -> Value {
+    let output = Command::new(bin())
+        .args(args)
+        .env("CODEX_HOME", codex_home)
+        .output()
+        .expect("run codex-wt");
+    assert!(
+        !output.status.success(),
+        "command unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("json error output")
+}
+
+fn run_raw(args: &[&str], codex_home: &Path) -> std::process::Output {
+    Command::new(bin())
+        .args(args)
+        .env("CODEX_HOME", codex_home)
+        .output()
+        .expect("run codex-wt")
+}
+
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .current_dir(repo)
@@ -131,6 +154,40 @@ fn applies_dirty_changes_only_when_requested() {
 }
 
 #[test]
+fn rejects_dirty_changes_when_base_is_not_source_head() {
+    let (_temp, repo) = fixture_repo();
+    let codex_home = TempDir::new().expect("codex home");
+    git(&repo, &["switch", "-c", "feature"]);
+    fs::write(repo.join("tracked.txt"), "feature committed\n").expect("feature file");
+    git(&repo, &["commit", "-am", "feature change"]);
+    fs::write(repo.join("tracked.txt"), "feature dirty\n").expect("dirty file");
+
+    let json = run_failure(
+        &[
+            "--json",
+            "create",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--slug",
+            "dirty-main",
+            "--include-dirty",
+        ],
+        codex_home.path(),
+    );
+
+    assert_eq!(json["ok"], false);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--include-dirty requires --base")
+    );
+    assert!(!codex_home.path().join("worktrees/dirty-main/repo").exists());
+}
+
+#[test]
 fn copies_untracked_files_only_when_requested() {
     let (_temp, repo) = fixture_repo();
     let codex_home = TempDir::new().expect("codex home");
@@ -173,6 +230,129 @@ fn copies_untracked_files_only_when_requested() {
     assert_eq!(
         fs::read_to_string(copied_path.join("notes/untracked.txt")).unwrap(),
         "hello\n"
+    );
+}
+
+#[test]
+fn failed_untracked_copy_removes_registered_worktree() {
+    let (_temp, repo) = fixture_repo();
+    let codex_home = TempDir::new().expect("codex home");
+    git(&repo, &["switch", "-c", "base-conflict"]);
+    fs::write(repo.join("conflict.txt"), "base tracked\n").expect("base conflict");
+    git(&repo, &["add", "conflict.txt"]);
+    git(&repo, &["commit", "-m", "base conflict"]);
+    git(&repo, &["switch", "main"]);
+    fs::write(repo.join("conflict.txt"), "source untracked\n").expect("source conflict");
+
+    let json = run_failure(
+        &[
+            "--json",
+            "create",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--base",
+            "base-conflict",
+            "--slug",
+            "conflict-cleanup",
+            "--include-untracked",
+        ],
+        codex_home.path(),
+    );
+
+    let failed_path = codex_home.path().join("worktrees/conflict-cleanup/repo");
+    assert_eq!(json["ok"], false);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("refusing to overwrite existing path")
+    );
+    assert!(!failed_path.exists());
+    let listed = git(&repo, &["worktree", "list", "--porcelain"]);
+    assert!(!listed.contains(failed_path.to_str().unwrap()));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_untracked_copy_through_symlink_ancestor() {
+    let (_temp, repo) = fixture_repo();
+    let codex_home = TempDir::new().expect("codex home");
+    let outside = TempDir::new().expect("outside");
+
+    git(&repo, &["switch", "-c", "base-symlink"]);
+    std::os::unix::fs::symlink(outside.path(), repo.join("linkdir")).expect("symlink");
+    git(&repo, &["add", "linkdir"]);
+    git(&repo, &["commit", "-m", "base symlink"]);
+    git(&repo, &["switch", "main"]);
+    fs::create_dir(repo.join("linkdir")).expect("source linkdir dir");
+    fs::write(repo.join("linkdir/file.txt"), "do not escape\n").expect("untracked nested file");
+
+    let json = run_failure(
+        &[
+            "--json",
+            "create",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--base",
+            "base-symlink",
+            "--slug",
+            "symlink-cleanup",
+            "--include-untracked",
+        ],
+        codex_home.path(),
+    );
+
+    assert_eq!(json["ok"], false);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("refusing symlink destination ancestor")
+    );
+    assert!(!outside.path().join("file.txt").exists());
+    assert!(
+        !codex_home
+            .path()
+            .join("worktrees/symlink-cleanup/repo")
+            .exists()
+    );
+}
+
+#[test]
+fn rejects_untracked_nested_git_repo_before_creating_worktree() {
+    let (_temp, repo) = fixture_repo();
+    let codex_home = TempDir::new().expect("codex home");
+    let nested = repo.join("nested");
+    fs::create_dir(&nested).expect("nested dir");
+    git(&nested, &["init", "-b", "main"]);
+
+    let json = run_failure(
+        &[
+            "--json",
+            "create",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--base",
+            "HEAD",
+            "--slug",
+            "nested-repo",
+            "--include-untracked",
+        ],
+        codex_home.path(),
+    );
+
+    assert_eq!(json["ok"], false);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("refusing unsupported untracked directory entry")
+    );
+    assert!(
+        !codex_home
+            .path()
+            .join("worktrees/nested-repo/repo")
+            .exists()
     );
 }
 
@@ -235,4 +415,32 @@ fn doctor_reports_setup_as_json() {
             .unwrap()
             .starts_with("git version")
     );
+}
+
+#[test]
+fn json_parse_errors_use_json_error_shape() {
+    let codex_home = TempDir::new().expect("codex home");
+    let json = run_failure(&["--json", "create", "--repo", "."], codex_home.path());
+    assert_eq!(json["ok"], false);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("required")
+    );
+}
+
+#[test]
+fn json_help_keeps_help_success_semantics() {
+    let codex_home = TempDir::new().expect("codex home");
+    let output = run_raw(&["--json", "--help"], codex_home.path());
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Usage: codex-wt"));
+    assert!(!stdout.contains("\"ok\": false"));
 }

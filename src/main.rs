@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, error::ErrorKind as ClapErrorKind};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
 #[command(name = "codex-wt")]
 #[command(about = "Create Codex-style detached Git worktrees")]
+#[command(color = clap::ColorChoice::Never)]
 struct Cli {
     #[arg(long, global = true, help = "Emit stable JSON")]
     json: bool,
@@ -45,7 +46,23 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let json_requested = std::env::args_os().any(|arg| arg == "--json");
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            if matches!(
+                error.kind(),
+                ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion
+            ) {
+                error.exit();
+            }
+            if json_requested {
+                print_json(&ErrorOutput::from_message(error.to_string()));
+                return ExitCode::FAILURE;
+            }
+            error.exit();
+        }
+    };
 
     match run(&cli) {
         Ok(output) => {
@@ -167,11 +184,13 @@ struct ErrorBody {
 
 impl ErrorOutput {
     fn from_error(error: &anyhow::Error) -> Self {
+        Self::from_message(format!("{error:#}"))
+    }
+
+    fn from_message(message: String) -> Self {
         Self {
             ok: false,
-            error: ErrorBody {
-                message: format!("{error:#}"),
-            },
+            error: ErrorBody { message },
         }
     }
 }

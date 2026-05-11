@@ -1,8 +1,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::ErrorKind;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -114,6 +115,12 @@ pub fn doctor() -> DoctorReport {
 pub fn create(options: CreateOptions) -> Result<CreateResult> {
     ensure_git_available()?;
     let repo = repo_root(&options.repo)?;
+    if options.include_dirty {
+        validate_dirty_base(&repo, &options.base)?;
+    }
+    if options.include_untracked {
+        validate_untracked_sources(&repo)?;
+    }
     let repo_name = repo.file_name().and_then(OsStr::to_str).ok_or_else(|| {
         anyhow!(
             "could not infer repository directory name from {}",
@@ -149,35 +156,18 @@ pub fn create(options: CreateOptions) -> Result<CreateResult> {
         return Err(error);
     }
 
-    let mut dirty_applied = false;
-    if options.include_dirty {
-        let patch = git_bytes(
-            Some(&repo),
-            [
-                OsStr::new("diff"),
-                OsStr::new("HEAD"),
-                OsStr::new("--binary"),
-            ],
-        )?;
-        dirty_applied = !patch.is_empty();
-        if dirty_applied {
-            git_with_input(
-                Some(&path),
-                [
-                    OsStr::new("apply"),
-                    OsStr::new("--binary"),
-                    OsStr::new("--whitespace=nowarn"),
-                ],
-                &patch,
-            )
-            .context("apply tracked dirty changes to worktree")?;
+    let post_create = apply_requested_changes(&repo, &path, &options);
+    let (dirty_applied, untracked_count) = match post_create {
+        Ok(result) => result,
+        Err(error) => {
+            if let Err(cleanup_error) = cleanup_worktree(&repo, &path, &parent) {
+                return Err(error.context(format!(
+                    "failed to clean up {} after create error: {cleanup_error:#}",
+                    path.display()
+                )));
+            }
+            return Err(error);
         }
-    }
-
-    let untracked_count = if options.include_untracked {
-        copy_untracked_files(&repo, &path)?
-    } else {
-        0
     };
 
     let head = git_trimmed(Some(&path), [OsStr::new("rev-parse"), OsStr::new("HEAD")])?;
@@ -194,6 +184,45 @@ pub fn create(options: CreateOptions) -> Result<CreateResult> {
         untracked_applied: untracked_count > 0,
         untracked_count,
     })
+}
+
+fn apply_requested_changes(
+    repo: &Path,
+    path: &Path,
+    options: &CreateOptions,
+) -> Result<(bool, usize)> {
+    let mut dirty_applied = false;
+    if options.include_dirty {
+        let patch = git_bytes(
+            Some(repo),
+            [
+                OsStr::new("diff"),
+                OsStr::new("HEAD"),
+                OsStr::new("--binary"),
+            ],
+        )?;
+        dirty_applied = !patch.is_empty();
+        if dirty_applied {
+            git_with_input(
+                Some(path),
+                [
+                    OsStr::new("apply"),
+                    OsStr::new("--binary"),
+                    OsStr::new("--whitespace=nowarn"),
+                ],
+                &patch,
+            )
+            .context("apply tracked dirty changes to worktree")?;
+        }
+    }
+
+    let untracked_count = if options.include_untracked {
+        copy_untracked_files(repo, path)?
+    } else {
+        0
+    };
+
+    Ok((dirty_applied, untracked_count))
 }
 
 pub fn list(repo: &Path) -> Result<WorktreeList> {
@@ -266,7 +295,77 @@ fn current_branch(path: &Path) -> Result<Option<String>> {
     Ok((!branch.is_empty()).then_some(branch))
 }
 
-fn copy_untracked_files(repo: &Path, target: &Path) -> Result<usize> {
+fn validate_dirty_base(repo: &Path, base: &str) -> Result<()> {
+    let head = resolve_commit(repo, "HEAD")?;
+    let base_commit = resolve_commit(repo, base)?;
+    if head != base_commit {
+        bail!(
+            "--include-dirty requires --base to resolve to the source checkout HEAD; HEAD is {head}, but {base} resolves to {base_commit}"
+        );
+    }
+    Ok(())
+}
+
+fn resolve_commit(repo: &Path, rev: &str) -> Result<String> {
+    let commit_rev = format!("{rev}^{{commit}}");
+    git_trimmed(
+        Some(repo),
+        [
+            OsStr::new("rev-parse"),
+            OsStr::new("--verify"),
+            OsStr::new(&commit_rev),
+        ],
+    )
+    .with_context(|| format!("resolve commit {rev}"))
+}
+
+fn cleanup_worktree(repo: &Path, path: &Path, parent: &Path) -> Result<()> {
+    git(
+        Some(repo),
+        [
+            OsStr::new("worktree"),
+            OsStr::new("remove"),
+            OsStr::new("--force"),
+            path.as_os_str(),
+        ],
+    )
+    .with_context(|| format!("remove failed worktree {}", path.display()))?;
+
+    match fs::remove_dir(parent) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(error) => return Err(error).with_context(|| format!("remove {}", parent.display())),
+    }
+    Ok(())
+}
+
+fn validate_untracked_sources(repo: &Path) -> Result<()> {
+    for rel_path in untracked_relative_paths(repo)? {
+        let source = repo.join(&rel_path);
+        let metadata = fs::symlink_metadata(&source)
+            .with_context(|| format!("inspect untracked {}", rel_path.display()))?;
+        if metadata.is_dir() {
+            bail!(
+                "refusing unsupported untracked directory entry: {}; nested Git repositories are not copied",
+                rel_path.display()
+            );
+        }
+        #[cfg(not(unix))]
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "refusing unsupported untracked symlink source on this platform: {}",
+                rel_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn untracked_relative_paths(repo: &Path) -> Result<Vec<PathBuf>> {
     let output = git_bytes(
         Some(repo),
         [
@@ -276,18 +375,23 @@ fn copy_untracked_files(repo: &Path, target: &Path) -> Result<usize> {
             OsStr::new("-z"),
         ],
     )?;
-    let mut count = 0;
-    for raw_path in output
+    output
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
-    {
-        let rel = String::from_utf8(raw_path.to_vec()).context("untracked path is not UTF-8")?;
-        let rel_path = safe_relative_path(&rel)?;
+        .map(|raw_path| {
+            let rel =
+                String::from_utf8(raw_path.to_vec()).context("untracked path is not UTF-8")?;
+            safe_relative_path(&rel)
+        })
+        .collect()
+}
+
+fn copy_untracked_files(repo: &Path, target: &Path) -> Result<usize> {
+    let mut count = 0;
+    for rel_path in untracked_relative_paths(repo)? {
         let source = repo.join(&rel_path);
         let destination = target.join(&rel_path);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        }
+        prepare_destination(target, &destination)?;
         copy_file_or_symlink(&source, &destination)
             .with_context(|| format!("copy untracked {}", rel_path.display()))?;
         count += 1;
@@ -295,16 +399,83 @@ fn copy_untracked_files(repo: &Path, target: &Path) -> Result<usize> {
     Ok(count)
 }
 
+fn prepare_destination(target: &Path, destination: &Path) -> Result<()> {
+    if !destination.starts_with(target) {
+        bail!(
+            "refusing destination outside worktree: {}",
+            destination.display()
+        );
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("destination has no parent: {}", destination.display()))?;
+    let relative_parent = parent
+        .strip_prefix(target)
+        .with_context(|| format!("resolve {} under {}", parent.display(), target.display()))?;
+
+    let mut current = target.to_path_buf();
+    for component in relative_parent.components() {
+        let Component::Normal(part) = component else {
+            bail!("refusing unsafe destination parent: {}", parent.display());
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "refusing symlink destination ancestor: {}",
+                    current.display()
+                );
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                bail!(
+                    "destination ancestor is not a directory: {}",
+                    current.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                fs::create_dir(&current).with_context(|| format!("create {}", current.display()))?
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", current.display()));
+            }
+        }
+    }
+
+    match fs::symlink_metadata(destination) {
+        Ok(_) => bail!(
+            "refusing to overwrite existing path: {}",
+            destination.display()
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", destination.display())),
+    }
+}
+
 fn copy_file_or_symlink(source: &Path, destination: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     if metadata.file_type().is_symlink() {
-        let target = fs::read_link(source)?;
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(target, destination)?;
         #[cfg(not(unix))]
-        fs::copy(source, destination)?;
+        {
+            bail!(
+                "refusing to copy symlink source on this platform: {}",
+                source.display()
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let target = fs::read_link(source)?;
+            std::os::unix::fs::symlink(target, destination)?;
+        }
     } else {
-        fs::copy(source, destination)?;
+        let mut input = File::open(source)?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        io::copy(&mut input, &mut output)?;
+        fs::set_permissions(destination, metadata.permissions())?;
     }
     Ok(())
 }
