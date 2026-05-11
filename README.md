@@ -49,12 +49,18 @@ Requirements:
 - Git
 - Rust and Cargo
 
-Clone and install:
+Clone and install the CLI:
 
 ```bash
 git clone https://github.com/JoelEmanuelNilsson/codex-wt.git
 cd codex-wt
 make install-local
+```
+
+Install the CLI and companion Codex skill:
+
+```bash
+make install-all
 ```
 
 If you already have the repo locally:
@@ -70,6 +76,12 @@ That installs the binary to:
 ```
 
 Make sure `~/.local/bin` is on your `PATH`.
+
+The companion skill installs to:
+
+```text
+~/.codex/skills/codex-worktree/SKILL.md
+```
 
 ## Quick Start
 
@@ -168,7 +180,19 @@ Errors include:
 
 ## For Codex Agents
 
-There is a companion skill at:
+This repo includes the companion skill at:
+
+```text
+skill/codex-worktree/SKILL.md
+```
+
+Install or update it with:
+
+```bash
+make install-skill
+```
+
+After installation, Codex loads it from:
 
 ```text
 ~/.codex/skills/codex-worktree/SKILL.md
